@@ -17,7 +17,7 @@ connections = {
 
 class LegacyQuerySet:
 	
-	queryset = QuerySet
+	queryset = None
 	cursor = None
 	columns = []
 	field_names = []

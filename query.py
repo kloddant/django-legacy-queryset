@@ -127,8 +127,10 @@ class LegacyQuerySet:
 			raise Exception(type(key))
 		original_sql = copy.copy(self.sql)
 		if limit:
+			assert(isinstance(limit, int))
 			self.sql += " LIMIT {limit} ".format(limit=limit)
 		if offset:
+			assert(isinstance(offset, int))
 			self.sql += " OFFSET {offset} ".format(offset=offset)
 		result = None
 		if isinstance(key, int):

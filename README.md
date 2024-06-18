@@ -10,5 +10,4 @@ Provides a read-only LegacyQuerySet class that can be used to support database v
 
 * Extending the default QuerySet proved difficult.  It was easier to create a wrapper class instead.
 * Overriding the model admin's get_queryset method does not appear to be necessary if the base_manager_name is overwritten.
-* This will break django-debug-toolbar.
 * LegacyQuerySets are read-only.  They cannot be used to write to the database.

@@ -17,6 +17,15 @@ connections = {
 
 class LegacyQuerySet:
 	
+	"""
+	Wrap a QuerySet with this to support database versions that Django refuses to support anymore even though the underlying sql queries still work.
+	Extending the default QuerySet proved difficult.  It was easier to create a wrapper class instead.
+	Usage:
+		1. Override the model's default manager with LegacyManager.
+		2. Override the model's base manager by adding base_manager_name = "objects" to its Meta class.  Otherwise foreign relations won't work, and the models will throw errors in the admin.
+	Overriding the model admin's get_queryset method does not appear to be necessary if the base_manager_name is overwritten.
+	"""
+	
 	queryset = None
 	cursor = None
 	columns = []
@@ -26,6 +35,7 @@ class LegacyQuerySet:
 	sql = ""
 	params = ()
 	executed = False
+	iterated = False
 	rows = []
 	pointer = 0
 			
@@ -48,7 +58,7 @@ class LegacyQuerySet:
 		except EmptyResultSet:
 			return
 		self.db = connections[self.queryset.db]
-		self.cursor = self.db.cursor()		
+		self.cursor = self.db.cursor()
 		
 	def __iter__(self):
 		return self
@@ -91,19 +101,29 @@ class LegacyQuerySet:
 			return
 		self.execute()
 		self.rows = self.cursor.fetchall()
+		self.close_cursor()
+		
+	def close_cursor(self):
+		self.cursor.close()
+		self.iterated = True
 		self.pointer = 0
 		
 	def __next__(self, default=None):
 		if not self.cursor:
 			raise StopIteration
-		self.execute()
-		if self.rows:
+		if self.iterated:
 			if self.pointer >= len(self.rows):
+				self.pointer = 0
 				raise StopIteration
 			row = self.rows[self.pointer]
 			self.pointer += 1
 		else:
+			self.execute()
 			row = self.cursor.fetchone()
+			if row:
+				self.rows.append(row)
+			else:
+				self.close_cursor()
 		if not row:
 			raise StopIteration
 		obj = self.row_to_object(row)

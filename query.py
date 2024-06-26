@@ -1,4 +1,4 @@
-import MySQLdb, copy
+import MySQLdb
 
 from django.conf import settings
 from django.db.models.fields.related import RelatedField, ForeignKey, ManyToManyField, OneToOneField
@@ -21,12 +21,13 @@ class LegacyQuerySet:
 	Wrap a QuerySet with this to support database versions that Django refuses to support anymore even though the underlying sql queries still work.
 	Extending the default QuerySet proved difficult.  It was easier to create a wrapper class instead.
 	Usage:
-		1. Override the model's default manager with LegacyManager.
+		1. Override the model's default manager with .managers.LegacyManager.
 		2. Override the model's base manager by adding base_manager_name = "objects" to its Meta class.  Otherwise foreign relations won't work, and the models will throw errors in the admin.
 	Overriding the model admin's get_queryset method does not appear to be necessary if the base_manager_name is overwritten.
 	"""
 	
 	queryset = None
+	db = None
 	cursor = None
 	columns = []
 	field_names = []
@@ -34,7 +35,6 @@ class LegacyQuerySet:
 	field_indices = []
 	sql = ""
 	params = ()
-	executed = False
 	iterated = False
 	rows = []
 	pointer = 0
@@ -44,7 +44,8 @@ class LegacyQuerySet:
 		while isinstance(queryset, type(self)) and hasattr(queryset, 'queryset'):
 			queryset = queryset.queryset
 		self.queryset = queryset
-		self.query = self.queryset.query
+		assert(isinstance(self.queryset, QuerySet))
+		self.rows = [] # This needs to be here to avoid some weird error with calling list() on previous LegacyQuerySets.
 		self.cursor = None
 		if isinstance(self.queryset, EmptyQuerySet):
 			return
@@ -56,34 +57,129 @@ class LegacyQuerySet:
 		try:
 			self.sql, self.params = compiler.as_sql()
 		except EmptyResultSet:
-			return
+			pass
+		
 		self.db = connections[self.queryset.db]
 		self.cursor = self.db.cursor()
 		
 	def __iter__(self):
-		return self
+		return self.clone()
+		
+	def __next__(self, default=None):
+		row = ()
+		if not self.cursor and not self.iterated:
+			self.cursor = self.db.cursor()
+		if self.iterated:
+			if self.pointer >= len(self.rows):
+				self.pointer = 0
+				raise StopIteration
+			row = self.rows[self.pointer]
+			self.pointer += 1
+		elif self.cursor:
+			self.execute()
+			if self.cursor._executed:
+				row = self.cursor.fetchone()
+			if row:
+				self.rows.append(row)
+			else:
+				self.close()
+				raise StopIteration
+		obj = self.row_to_object(row)
+		return obj
+		
+	def __getitem__(self, key):
+		clone = self.clone()
+		clone.fetch()
+		result = list(clone)[key]
+		clone.close()
+		return result
+	
+	# pickle
+	def __getstate__(self):
+		clone = self.clone()
+		state = clone.__dict__
+		if 'queryset' in state:
+			del state['queryset']
+		if 'db' in state:
+			del state['db']
+		if 'cursor' in state:
+			del state['cursor']
+		return state
+	
+	# unpickle
+	def __setstate__(self, state):
+		for key, value in state.items():
+			setattr(self, key, value)
+		queryset = state['model'].objects.get_queryset()
+		self.__init__(queryset)
+		
+	def __len__(self):
+		return self.count()
+		
+	def connect(self):
+		self.db = MySQLdb.connect(
+			host = settings.DATABASES[self.queryset.db]['HOST'],
+			port = int(settings.DATABASES[self.queryset.db].get('PORT', 3306)),
+			database = settings.DATABASES[self.queryset.db]['NAME'],
+			user = settings.DATABASES[self.queryset.db]['USER'], 
+			password = settings.DATABASES[self.queryset.db]['PASSWORD'],
+		)
+		self.cursor = self.db.cursor()
 		
 	def execute(self):
 		if not self.sql:
 			return
-		if self.cursor._executed or self.executed:
+		if self.cursor._executed:
 			return
-		self.cursor.execute(self.sql, self.params)
+		if self.iterated:
+			return
+		print(self.sql, self.params, "\n")
+		try:
+			self.cursor.execute(self.sql, self.params)
+		except Exception as e:
+			print(e)
+			self.connect()
+			self.execute()
+			return
 		self.cursor._executed = True
-		self.executed = True
 		
-	def reset_cursor(self):
-		self.cursor = self.db.cursor()
-		self.executed = False
+	def fetch(self):
+		if not self.sql:
+			return
+		if not self.cursor:
+			return
+		if self.iterated:
+			return
+		executed = self.execute()
+		if self.cursor._executed:
+			self.rows = list(self.cursor.fetchall())
+		self.close()
+		
+	def clone(self):
+		clone = type(self)(self.queryset)
+		for key, value in self.__dict__.items():
+			if key in ['db', 'cursor', 'query']:
+				continue
+			setattr(clone, key, value)
+		return clone
+			
+	def close(self):
+		if hasattr(self, 'cursor') and self.cursor:
+			self.cursor.close()
+			del self.cursor
+		self.iterated = True
+		self.pointer = 0
 	
 	def row_to_object(self, row):
 		keys_and_values = {
-			**{self.columns[i].target.name: row[i] for i in self.field_indices if not isinstance(self.columns[i].target, RelatedField)},
-			**{self.field_names[i]: row[i] for i in self.field_indices if self.field_names},
+			**{self.columns[i].target.name: row[i] for i in self.field_indices if not isinstance(self.columns[i].target, RelatedField) and i < len(row)},
+			**{self.field_names[i]: row[i] for i in self.field_indices if self.field_names and i < len(row)},
 		}
-		if self.queryset._iterable_class == ModelIterable:
+		if not hasattr(self, 'queryset') or self.queryset._iterable_class == ModelIterable:
 			obj = self.model(**keys_and_values)
 			for i in self.field_indices:
+				if i >= len(self.columns) or i >= len(row):
+					break
 				if isinstance(self.columns[i].target, (ForeignKey, OneToOneField)):
 					setattr(obj, self.columns[i].target.name+"_id", row[i])
 		elif self.queryset._iterable_class == ValuesIterable:
@@ -94,113 +190,45 @@ class LegacyQuerySet:
 			raise Exception(self.queryset._iterable_class)
 		return obj
 		
-	def fetch_all(self):
-		if not self.cursor:
-			return
-		if self.rows:
-			return
-		self.execute()
-		self.rows = self.cursor.fetchall()
-		self.close_cursor()
-		
-	def close_cursor(self):
-		self.cursor.close()
-		self.iterated = True
-		self.pointer = 0
-		
-	def __next__(self, default=None):
-		if not self.cursor:
-			raise StopIteration
-		if self.iterated:
-			if self.pointer >= len(self.rows):
-				self.pointer = 0
-				raise StopIteration
-			row = self.rows[self.pointer]
-			self.pointer += 1
-		else:
-			self.execute()
-			row = self.cursor.fetchone()
-			if row:
-				self.rows.append(row)
-			else:
-				self.close_cursor()
-		if not row:
-			raise StopIteration
-		obj = self.row_to_object(row)
-		if not obj:
-			raise StopIteration
-		return obj
-		
-	def __getitem__(self, key):
-		if not self.cursor:
-			return None
-		limit = None
-		offset = 0
-		key = int(key) if isinstance(key, str) and key.isdigit() else key
-		if isinstance(key, int):
-			limit = 1
-			offset = key
-		elif isinstance(key, slice):
-			limit = key.stop - key.start if key.start and key.stop else key.stop
-			offset = key.start
-		elif settings.DEBUG:
-			raise Exception(type(key))
-		original_sql = copy.copy(self.sql)
-		if limit:
-			assert(isinstance(limit, int))
-			self.sql += " LIMIT {limit} ".format(limit=limit)
-		if offset:
-			assert(isinstance(offset, int))
-			self.sql += " OFFSET {offset} ".format(offset=offset)
-		result = None
-		if isinstance(key, int):
-			for obj in self:
-				result = obj
-				break
-			if not result:
-				raise IndexError
-		else:
-			self.fetch_all()
-			result = list(self)
-		self.sql = copy.copy(original_sql)
-		return result
-		
 	def first(self):
-		for obj in self:
-			return obj
+		clone = self.clone()
+		result = None
+		for obj in clone:
+			result = obj
 			break
-		return None
+		clone.close()
+		return result
 		
 	def last(self):
 		last = None
-		for obj in self:
+		clone = self.clone()
+		for obj in clone:
 			last = obj
+		clone.close()
 		return last
 	
 	def values(self, *fields, **expressions):
-		return type(self)(queryset=self.queryset.values(*fields, **expressions))
+		clone = self.clone()
+		values = type(self)(queryset=clone.queryset.values(*fields, **expressions))
+		clone.close()
+		return values
 		
 	def values_list(self, *fields, flat=False, named=False):
+		clone = self.clone()
 		if len(fields) == 1 and flat:
-			values = self.values()
+			values = clone.values()
 			values_list = [row.get(fields[0]) for row in values]
 		else:
-			values_list = type(self)(queryset=self.queryset.values_list(*fields, flat=False, named=False))
+			values_list = type(self)(queryset=clone.queryset.values_list(*fields, flat=False, named=False))
+		clone.close()
 		return values_list
 		
 	def count(self):
-		if not self.cursor:
-			return 0
-		if self.rows:
-			result = len(self.rows)
-		else:
-			self.execute()
-			result = self.cursor.rowcount
-			self.reset_cursor()
+		clone = self.clone()
+		clone.fetch()
+		result = len(clone.rows)
+		clone.close()
 		return result
-		
-	def __len__(self):
-		return self.count()
 		
 	def filter(self, *args, **kwargs):
 		queryset = self.queryset.filter(*args, **kwargs)
@@ -219,16 +247,17 @@ class LegacyQuerySet:
 		return type(self)(queryset)
 		
 	def exists(self):
-		if not self.cursor:
-			return False
 		return bool(self.count())
 		
 	def none(self):
-		return self.queryset.none()
+		clone = self.clone()
+		clone.rows = []
+		clone.iterated = True
+		return clone
 		
 	def all(self):
-		self.fetch_all()
-		return self
+		queryset = self.queryset.all()
+		return type(self)(queryset)
 		
 	def get(self, *args, **kwargs):
 		queryset = self.queryset.filter(*args, **kwargs)
